@@ -30,54 +30,6 @@ class WeightedModernBERTTrainer(Trainer):
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
-    def create_scheduler(self, num_training_steps: int, optimizer=None):
-        if optimizer is None:
-            optimizer = self.optimizer
-        if self.lr_scheduler is None:  # Check if scheduler already exists
-            self.lr_scheduler = WSDLearningRateScheduler(
-                optimizer=optimizer,
-                warmup_ratio=self.args.warmup_ratio,
-                decay_ratio=0.1,
-                min_lr_ratio=0.1,
-                total_steps=num_training_steps,
-            )
-        return self.lr_scheduler
-
-
-class WSDLearningRateScheduler(LambdaLR):
-    def __init__(self, optimizer, warmup_ratio, decay_ratio, min_lr_ratio, total_steps, last_epoch=-1):
-        self.warmup_ratio = warmup_ratio
-        self.decay_ratio = decay_ratio
-        self.min_lr_ratio = min_lr_ratio
-        self.total_steps = total_steps
-        self.peak_lr = None
-        self.min_lr = None
-
-        self.warmup_steps = int(self.warmup_ratio * self.total_steps)
-        self.decay_steps = int(self.decay_ratio * self.total_steps)
-        self.stable_steps = self.total_steps - self.warmup_steps - self.decay_steps
-
-        if self.stable_steps < 0:
-            raise ValueError("Total steps are too small for the given warmup and decay ratios.")
-
-        super().__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
-
-    def lr_lambda(self, current_step):
-        if self.peak_lr is None:  # Initialize peak_lr and min_lr here
-            self.peak_lr = self.optimizer.defaults['lr']
-            self.min_lr = self.peak_lr * self.min_lr_ratio
-        if current_step < self.warmup_steps:
-            return float(current_step) / float(max(1, self.warmup_steps))
-        elif current_step < self.warmup_steps + self.stable_steps:
-            return 1.0
-        elif current_step < self.warmup_steps + self.stable_steps + self.decay_steps:
-            decay_step = current_step - self.warmup_steps - self.stable_steps
-            decay_step = min(decay_step, self.decay_steps - 1)  # Clamp, as in PPLX
-            return (self.min_lr * self.peak_lr) / (decay_step / self.decay_steps * (self.peak_lr - self.min_lr) + self.min_lr)
-        else:
-            return self.min_lr / self.peak_lr
-
-
 
 def load_and_prepare_data(min_count: int = 50) -> tuple[DatasetDict, dict[str, int], dict[int, str]]:
     """
@@ -118,6 +70,7 @@ def load_and_prepare_data(min_count: int = 50) -> tuple[DatasetDict, dict[str, i
 
     return dataset, label2id, id2label
 
+
 def train_model(dataset, label2id, id2label):
     model_id = "answerdotai/ModernBERT-base"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -156,9 +109,9 @@ def train_model(dataset, label2id, id2label):
 
     training_args = TrainingArguments(
         output_dir="modernbert-winevariety",
-        per_device_train_batch_size=256,
-        per_device_eval_batch_size=256,
-        learning_rate=1e-4,
+        per_device_train_batch_size=192,
+        per_device_eval_batch_size=192,
+        learning_rate=8e-5,
         num_train_epochs=5,
         logging_steps=100,
         eval_steps=100,
@@ -178,7 +131,6 @@ def train_model(dataset, label2id, id2label):
         lr_scheduler_type="linear",
     )
 
-    # Do not override the Trainer's default optimizer and scheduler.
     trainer = WeightedModernBERTTrainer(
         model=model,
         args=training_args,
@@ -193,6 +145,7 @@ def train_model(dataset, label2id, id2label):
     trainer.push_to_hub()
     return model, tokenizer, tokenized_dataset, training_args
 
+
 def compute_metrics(training_args, eval_pred):
     predictions, labels = eval_pred
     preds = np.argmax(predictions, axis=1)
@@ -200,10 +153,18 @@ def compute_metrics(training_args, eval_pred):
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1_val}
 
-def evaluate_model(model: AutoModelForSequenceClassification, tokenizer: AutoTokenizer, tokenized_dataset: DatasetDict, label2id: dict[str, int], id2label: dict[int, str], training_args: TrainingArguments):
+
+def evaluate_model(
+    model: AutoModelForSequenceClassification,
+    tokenizer: AutoTokenizer,
+    tokenized_dataset: DatasetDict,
+    label2id: dict[str, int],
+    id2label: dict[int, str],
+    training_args: TrainingArguments
+):
     # Disable any reporting during evaluation by setting the report_to list to empty.
     training_args.report_to = []
-    
+
     # Initialize the trainer for evaluation using the updated training_args.
     trainer = WeightedModernBERTTrainer(
         model=model,
@@ -214,28 +175,31 @@ def evaluate_model(model: AutoModelForSequenceClassification, tokenizer: AutoTok
         compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
     )
 
-    # Evaluate the model.
-    eval_results = trainer.evaluate()
-    print(f"Evaluation Results: {eval_results}")
+    # Evaluate the model for metrics like loss (this returns a dict).
+    eval_metrics = trainer.evaluate()
+    print(f"Evaluation Metrics: {eval_metrics}")
 
-    # Extract predictions and labels from the evaluation results
-    predictions = np.argmax(eval_results.predictions, axis=1)
-    labels = eval_results.label_ids
+    # Use trainer.predict() to obtain predictions and labels.
+    prediction_output = trainer.predict(tokenized_dataset["test"])
+    predictions = np.argmax(prediction_output.predictions, axis=1)
+    labels = prediction_output.label_ids
 
     # Convert numeric labels to string labels
     predictions = [id2label[p] for p in predictions]
     labels = [id2label[l] for l in labels]
 
     # Calculate accuracy
-    accuracy = sum([p == l for p, l in zip(predictions, labels)]) / len(labels)
+    accuracy = sum(p == l for p, l in zip(predictions, labels)) / len(labels)
     print(f"Accuracy: {accuracy:.2f}")
 
     # Calculate per-class F1 scores and other metrics
-    report = classification_report(labels, predictions, target_names=list(id2label.values()), output_dict=True)
+    report = classification_report(
+        labels, predictions, target_names=list(id2label.values()), output_dict=True
+    )
 
-    # Print F1 scores for tail classes (varieties with < 100 samples in the *training* set):
-    print("\nPer-Class F1 Scores (for varieties with < 100 samples in the *training* set):")
-    train_counts = tokenized_dataset['train'].to_pandas()['label'].value_counts()
+    # Print F1 scores for tail classes (varieties with < 100 samples in the training set)
+    print("\nPer-Class F1 Scores (for varieties with < 100 samples in the training set):")
+    train_counts = tokenized_dataset["train"].to_pandas()["label"].value_counts()
     for variety, metrics in report.items():
         if variety in id2label.values():
             variety_id = label2id[variety]
@@ -248,23 +212,25 @@ def evaluate_model(model: AutoModelForSequenceClassification, tokenizer: AutoTok
     sns.heatmap(
         cm,
         annot=True,
-        fmt='d',
-        cmap='Blues',
+        fmt="d",
+        cmap="Blues",
         xticklabels=list(id2label.values()),
-        yticklabels=list(id2label.values())
+        yticklabels=list(id2label.values()),
     )
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.title('Confusion Matrix')
+    plt.xlabel("Predicted")
+    plt.ylabel("Actual")
+    plt.title("Confusion Matrix")
     plt.show()
 
-def main():  # No parameters needed
+
+def main():
     # Load and prepare data, filtering rare varieties
     dataset, label2id, id2label = load_and_prepare_data(min_count=50)
 
     print("Training model...")
-    model, tokenizer, tokenized_dataset, training_args = train_model(dataset, label2id, id2label)  
-    evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label, training_args)  
+    model, tokenizer, tokenized_dataset, training_args = train_model(dataset, label2id, id2label)
+    evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label, training_args)
+
 
 if __name__ == "__main__":
     main()
