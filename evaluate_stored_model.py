@@ -33,7 +33,7 @@ class WeightedModernBERTTrainer(Trainer):
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
-def compute_metrics(eval_pred):
+def compute_metrics(training_args, eval_pred):
     predictions, labels = eval_pred
     preds = np.argmax(predictions, axis=1)
     f1_val = f1_score(labels, preds, average="weighted")
@@ -83,11 +83,13 @@ def main():
         train_dataset=None,
         eval_dataset=tokenized_dataset["test"],
         class_weights=None,  # Not needed at evaluation time
-        compute_metrics=compute_metrics
+        compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred) # Use lambda for consistency
     )
 
     # Run evaluation.
     print("Running evaluation...")
+     # Enable TensorFloat32 for performance, as suggested by the warning.
+    torch.set_float32_matmul_precision('high')
     eval_metrics = trainer.evaluate()
     print("Evaluation Metrics:", eval_metrics)
 
