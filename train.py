@@ -6,8 +6,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback,
-    AdamW,
 )
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
 import seaborn as sns
@@ -147,11 +147,11 @@ def train_model(dataset, label2id, id2label):
         per_device_eval_batch_size=256,
         learning_rate=1e-4,
         num_train_epochs=5,
-        logging_steps=250,
-        eval_steps=250,
-        evaluation_strategy="steps",
+        logging_steps=200,
+        eval_steps=100,
+        eval_strategy="steps",
         save_strategy="steps",
-        save_steps=500,
+        save_steps=200,
         load_best_model_at_end=True,
         report_to="wandb",
         run_name="modernbert-wine-classification",
