@@ -33,14 +33,15 @@ class WeightedModernBERTTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer=None):
         if optimizer is None:
             optimizer = self.optimizer
-        # Create and return our custom WSD scheduler
-        return WSDLearningRateScheduler(
-            optimizer=optimizer,
-            warmup_ratio=self.args.warmup_ratio,
-            decay_ratio=0.1,         # You can adjust the decay ratio if needed.
-            min_lr_ratio=0.1,        # The minimum LR ratio.
-            total_steps=num_training_steps,
-        )
+        if self.lr_scheduler is None:  # Check if scheduler already exists
+            self.lr_scheduler = WSDLearningRateScheduler(
+                optimizer=optimizer,
+                warmup_ratio=self.args.warmup_ratio,
+                decay_ratio=0.1,
+                min_lr_ratio=0.1,
+                total_steps=num_training_steps,
+            )
+        return self.lr_scheduler
 
 
 class WSDLearningRateScheduler(LambdaLR):
@@ -183,6 +184,10 @@ def train_model(dataset, label2id, id2label):
         compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
+
+    # Calculate total_training_steps *before* creating the scheduler.
+    num_training_steps = len(tokenized_dataset["train"]) // training_args.per_device_train_batch_size * training_args.num_train_epochs
+    trainer.create_scheduler(num_training_steps) 
 
     trainer.train()
     trainer.push_to_hub()
