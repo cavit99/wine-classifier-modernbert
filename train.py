@@ -105,12 +105,15 @@ def train_model(dataset, label2id, id2label):
     except:
         print("Tokenized dataset not found. Tokenizing...")
         def tokenize_function(examples):
-            return tokenizer(
+            tokens = tokenizer(
                 examples["text"],
                 padding="max_length",
                 truncation=True,
                 max_length=256
             )
+            # Convert wine variety to numerical label using your mapping
+            tokens["label"] = [label2id[variety] for variety in examples["variety"]]
+            return tokens
 
         # Tokenize dataset
         tokenized_dataset = dataset.map(tokenize_function, batched=True)
