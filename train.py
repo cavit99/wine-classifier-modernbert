@@ -16,7 +16,6 @@ from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 import torch
 import os
-import wandb
 
 class WeightedModernBERTTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
@@ -27,7 +26,8 @@ class WeightedModernBERTTrainer(Trainer):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
-        loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights)
+        weight = self.class_weights.to(logits.device)
+        loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
