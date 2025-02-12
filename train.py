@@ -7,8 +7,6 @@ from transformers import (
     TrainingArguments,
     EarlyStoppingCallback,
 )
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
 import seaborn as sns
 import matplotlib.pyplot as plt
