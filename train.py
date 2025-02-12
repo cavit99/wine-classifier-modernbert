@@ -25,10 +25,22 @@ class WeightedModernBERTTrainer(Trainer):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.logits
-        weight = self.class_weights.to(logits.device)
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
         loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if optimizer is None:
+            optimizer = self.optimizer
+        # Create and return our custom WSD scheduler
+        return WSDLearningRateScheduler(
+            optimizer=optimizer,
+            warmup_ratio=self.args.warmup_ratio,
+            decay_ratio=0.1,         # You can adjust the decay ratio if needed.
+            min_lr_ratio=0.1,        # The minimum LR ratio.
+            total_steps=num_training_steps,
+        )
 
 
 class WSDLearningRateScheduler(LambdaLR):
@@ -111,7 +123,6 @@ def train_model(dataset, label2id, id2label):
         print("Tokenized dataset loaded from disk.")
     except Exception as e:
         print("Tokenized dataset not found. Tokenizing now...")
-        # Tokenize by forming a text field from 'country' and 'description'
         def tokenize_function(examples):
             tokens = tokenizer(
                 examples["text"],
@@ -121,7 +132,6 @@ def train_model(dataset, label2id, id2label):
             )
             tokens["label"] = [label2id[variety] for variety in examples["variety"]]
             return tokens
-
         tokenized_dataset = dataset.map(tokenize_function, batched=True)
         tokenized_dataset.save_to_disk("tokenized_wine_dataset")
 
@@ -140,7 +150,6 @@ def train_model(dataset, label2id, id2label):
         id2label=id2label,
     )
 
-    # --- WSD Setup ---
     training_args = TrainingArguments(
         output_dir="modernbert-winevariety",
         per_device_train_batch_size=256,
@@ -161,26 +170,10 @@ def train_model(dataset, label2id, id2label):
         bf16=True,
         push_to_hub=True,
         hub_model_id="spawn99/modernbert-wine-classification",
-        warmup_ratio=0.06,  
+        warmup_ratio=0.08,  
     )
 
-    optimizer = AdamW(model.parameters(), lr=training_args.learning_rate)
-
-    # Calculate total steps (important for WSD)
-    total_steps = len(tokenized_dataset["train"]) // training_args.per_device_train_batch_size * training_args.num_train_epochs
-    total_steps = total_steps // training_args.gradient_accumulation_steps
-
-    # Create the WSD scheduler
-    lr_scheduler = WSDLearningRateScheduler(
-        optimizer=optimizer,
-        warmup_ratio=training_args.warmup_ratio,
-        decay_ratio=0.1,
-        min_lr_ratio=0.1,
-        total_steps=total_steps,
-    )
-    # --- End WSD Setup ---
-
-    # Initialize trainer with validation set, custom scheduler
+    # Do not override the Trainer's default optimizer and scheduler.
     trainer = WeightedModernBERTTrainer(
         model=model,
         args=training_args,
@@ -189,15 +182,10 @@ def train_model(dataset, label2id, id2label):
         class_weights=class_weights,
         compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-        optimizers=(optimizer, lr_scheduler),  # Pass both optimizer and scheduler
     )
 
-    # Train model, return training args
     trainer.train()
-
-    # Push the best model to the Hugging Face Hub.
     trainer.push_to_hub()
-
     return model, tokenizer, tokenized_dataset, training_args
 
 def compute_metrics(training_args, eval_pred):
@@ -208,17 +196,20 @@ def compute_metrics(training_args, eval_pred):
     return {"accuracy": acc, "f1": f1_val}
 
 def evaluate_model(model: AutoModelForSequenceClassification, tokenizer: AutoTokenizer, tokenized_dataset: DatasetDict, label2id: dict[str, int], id2label: dict[int, str], training_args: TrainingArguments):
-    # Initialize trainer for evaluation (use passed training_args)
+    # Disable any reporting during evaluation by setting the report_to list to empty.
+    training_args.report_to = []
+    
+    # Initialize the trainer for evaluation using the updated training_args.
     trainer = WeightedModernBERTTrainer(
         model=model,
-        args=training_args.set_report_to([]),  
+        args=training_args,
         train_dataset=None,
         eval_dataset=tokenized_dataset["test"],
         class_weights=None,  
         compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
     )
 
-    # Use the Trainer's evaluate() method
+    # Evaluate the model.
     eval_results = trainer.evaluate()
     print(f"Evaluation Results: {eval_results}")
 
