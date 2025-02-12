@@ -66,7 +66,8 @@ def main():
     # Load the model and tokenizer from the checkpoint.
     print("Loading model from checkpoint:", args.checkpoint_dir)
     model = AutoModelForSequenceClassification.from_pretrained(args.checkpoint_dir)
-    tokenizer = AutoTokenizer.from_pretrained(args.checkpoint_dir)
+    model_id = "answerdotai/ModernBERT-base"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     # Create basic training arguments for evaluation.
     training_args = TrainingArguments(
