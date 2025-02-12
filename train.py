@@ -174,7 +174,8 @@ def train_model(dataset, label2id, id2label):
         bf16=True,
         push_to_hub=True,
         hub_model_id="spawn99/modernbert-wine-classification",
-        warmup_ratio=0.08,  
+        warmup_ratio=0.08,
+        lr_scheduler_type="linear",
     )
 
     # Do not override the Trainer's default optimizer and scheduler.
