@@ -7,15 +7,17 @@ from transformers import (
     Trainer,
     TrainingArguments,
     pipeline,
-    EarlyStoppingCallback
+    EarlyStoppingCallback,
+    AdamW
 )
-from sklearn.metrics import confusion_matrix, classification_report, f1_score
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
 import seaborn as sns
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 import torch
 import os
+from torch.optim.lr_scheduler import LambdaLR
 
 class WeightedModernBERTTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
@@ -30,6 +32,51 @@ class WeightedModernBERTTrainer(Trainer):
         loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
+
+class WSDLearningRateScheduler(LambdaLR):
+    """
+    Warmup-Stable-Decay (WSD) learning rate scheduler.
+    
+    The schedule is divided into three phases:
+     - Warmup: linear growth from 0 to peak_lr.
+     - Stable: remaining constant at the peak.
+     - Decay: inverse decay of the learning rate from 1.0 -> min_lr/peak_lr.
+     
+    The lambda function returns a multiplicative factor that is applied
+    to the optimizer's initial (peak) learning rate.
+    """
+    def __init__(self, optimizer, warmup_ratio, decay_ratio, min_lr_ratio, total_steps, last_epoch=-1):
+        self.warmup_ratio = warmup_ratio
+        self.decay_ratio = decay_ratio
+        self.min_lr_ratio = min_lr_ratio
+        self.total_steps = total_steps
+        self.peak_lr = optimizer.defaults['lr']
+        self.min_lr = self.peak_lr * min_lr_ratio
+
+        self.warmup_steps = int(self.warmup_ratio * self.total_steps)
+        self.decay_steps = int(self.decay_ratio * self.total_steps)
+        self.stable_steps = self.total_steps - self.warmup_steps - self.decay_steps
+
+        if self.stable_steps < 0:
+            raise ValueError("Total steps are too small for the given warmup and decay ratios.")
+
+        super().__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
+
+    def lr_lambda(self, current_step):
+        # Warmup phase: linear increase from 0 to 1.
+        if current_step < self.warmup_steps:
+            return float(current_step) / float(max(1, self.warmup_steps))
+        # Stable phase: constant multiplier (1.0).
+        elif current_step < self.warmup_steps + self.stable_steps:
+            return 1.0
+        # Decay phase: inverse decay from 1.0 to min_lr/peak_lr.
+        elif current_step < self.warmup_steps + self.stable_steps + self.decay_steps:
+            decay_step = current_step - self.warmup_steps - self.stable_steps
+            # Clamp the decay step as in the provided example.
+            decay_step = min(decay_step, self.decay_steps - 1)
+            return (self.min_lr * self.peak_lr) / (decay_step / self.decay_steps * (self.peak_lr - self.min_lr) + self.min_lr)
+        else:
+            return self.min_lr / self.peak_lr
 
 def load_and_prepare_data(min_count=50):
     processed_dataset_path = "processed_dataset"
@@ -98,11 +145,10 @@ def train_model(dataset, label2id, id2label):
     model_id = "answerdotai/ModernBERT-base"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # --- LOAD DATASET IF IT EXISTS ---
     try:
         tokenized_dataset = load_from_disk("tokenized_wine_dataset")
         print("Tokenized dataset loaded from disk.")
-    except:
+    except Exception as e:
         print("Tokenized dataset not found. Tokenizing...")
         def tokenize_function(examples):
             tokens = tokenizer(
@@ -135,19 +181,19 @@ def train_model(dataset, label2id, id2label):
         label2id=label2id,
         id2label=id2label,
     )
-
+    
     # Modify training arguments to use validation set
     training_args = TrainingArguments(
         output_dir="modernbert-variety",
-        per_device_train_batch_size=128,
-        per_device_eval_batch_size=128,
-        learning_rate=5e-5,
+        per_device_train_batch_size=256,
+        per_device_eval_batch_size=256,
+        learning_rate=5e-5,  # This is the peak learning rate.
         num_train_epochs=4,
-        logging_steps=100,
-        eval_steps=100,
+        logging_steps=200,
+        eval_steps=200,
         eval_strategy="steps",
         save_strategy="steps",
-        save_steps=300,
+        save_steps=400,
         load_best_model_at_end=True,
         report_to="wandb",
         run_name="modernbert-wine-classification",
@@ -156,9 +202,36 @@ def train_model(dataset, label2id, id2label):
         max_grad_norm=1.0,
         skip_memory_metrics=True,
         bf16=True,
+        push_to_hub=True,  # Enable push to hub
+        hub_model_id="spawn99/modernbert-wine-classification"  # Replace with your Hub repo name
     )
 
-    # Initialize trainer with validation set
+    # --- NEW: Create the optimizer and custom WSD scheduler ---
+    # Use AdamW as the optimizer.
+    optimizer = AdamW(model.parameters(), lr=training_args.learning_rate)
+    
+    # Compute total training steps.
+    total_steps = (len(tokenized_dataset['train']) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
+    # Account for gradient accumulation steps if any.
+    if training_args.gradient_accumulation_steps > 1:
+        total_steps = total_steps // training_args.gradient_accumulation_steps
+
+    # Define scheduler hyperparameters.
+    warmup_ratio = 0.1  # Warmup for 10% of total steps.
+    decay_ratio = 0.1   # Decay for 10% of total steps.
+    min_lr_ratio = 0.1  # Minimum learning rate is 10% of peak.
+    
+    # Create the custom WSD learning rate scheduler.
+    lr_scheduler = WSDLearningRateScheduler(
+        optimizer=optimizer,
+        warmup_ratio=warmup_ratio,
+        decay_ratio=decay_ratio,
+        min_lr_ratio=min_lr_ratio,
+        total_steps=total_steps,
+    )
+    # --- END NEW: optimizer and scheduler setup ---
+
+    # Initialize trainer with validation set and pass (optimizer, scheduler)
     trainer = WeightedModernBERTTrainer(
         model=model,
         args=training_args,
@@ -166,19 +239,24 @@ def train_model(dataset, label2id, id2label):
         eval_dataset=tokenized_dataset["validation"],  # Use validation instead of test
         class_weights=class_weights,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
+        optimizers=(optimizer, lr_scheduler)  # Pass the custom optimizer and scheduler
     )
 
     # Train model
     trainer.train()
 
+    # Push the best model to the Hugging Face Hub.
+    trainer.push_to_hub()
+
     return model, tokenizer, tokenized_dataset
 
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    f1 = f1_score(labels, predictions, average="weighted")
-    return {"f1": f1}
+    preds = np.argmax(predictions, axis=1)
+    f1_val = f1_score(labels, preds, average="weighted")
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc, "f1": f1_val}
 
 def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
@@ -190,8 +268,10 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
         # Use the same concatenation as during training:
         input_text = item['country'] + " [SEP] " + item['description']
         pred = classifier(input_text)[0]
-        predictions.append(int(pred['label'].split('_')[-1]))
-        labels.append(item['label'])
+        # Use the predicted string label directly:
+        predictions.append(pred['label'])
+        # Convert the ground truth numeric label to the string label:
+        labels.append(id2label[item['label']])
     
     # Calculate accuracy
     accuracy = sum([p == l for p, l in zip(predictions, labels)]) / len(labels)
