@@ -8,8 +8,9 @@ from transformers import (
     TrainingArguments,
     pipeline,
     EarlyStoppingCallback,
-    AdamW
+    AdamW,
 )
+from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -17,7 +18,7 @@ from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 import torch
 import os
-from torch.optim.lr_scheduler import LambdaLR
+
 
 class WeightedModernBERTTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
@@ -33,18 +34,8 @@ class WeightedModernBERTTrainer(Trainer):
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
+
 class WSDLearningRateScheduler(LambdaLR):
-    """
-    Warmup-Stable-Decay (WSD) learning rate scheduler.
-    
-    The schedule is divided into three phases:
-     - Warmup: linear growth from 0 to peak_lr.
-     - Stable: remaining constant at the peak.
-     - Decay: inverse decay of the learning rate from 1.0 -> min_lr/peak_lr.
-     
-    The lambda function returns a multiplicative factor that is applied
-    to the optimizer's initial (peak) learning rate.
-    """
     def __init__(self, optimizer, warmup_ratio, decay_ratio, min_lr_ratio, total_steps, last_epoch=-1):
         self.warmup_ratio = warmup_ratio
         self.decay_ratio = decay_ratio
@@ -63,20 +54,18 @@ class WSDLearningRateScheduler(LambdaLR):
         super().__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, current_step):
-        # Warmup phase: linear increase from 0 to 1.
         if current_step < self.warmup_steps:
             return float(current_step) / float(max(1, self.warmup_steps))
-        # Stable phase: constant multiplier (1.0).
         elif current_step < self.warmup_steps + self.stable_steps:
             return 1.0
-        # Decay phase: inverse decay from 1.0 to min_lr/peak_lr.
         elif current_step < self.warmup_steps + self.stable_steps + self.decay_steps:
             decay_step = current_step - self.warmup_steps - self.stable_steps
-            # Clamp the decay step as in the provided example.
-            decay_step = min(decay_step, self.decay_steps - 1)
+            decay_step = min(decay_step, self.decay_steps -1) #Clamp, as in PPLX
             return (self.min_lr * self.peak_lr) / (decay_step / self.decay_steps * (self.peak_lr - self.min_lr) + self.min_lr)
         else:
             return self.min_lr / self.peak_lr
+
+
 
 def load_and_prepare_data(min_count=50):
     processed_dataset_path = "processed_dataset"
@@ -104,7 +93,7 @@ def load_and_prepare_data(min_count=50):
 
         # Combine country and description
         df["text"] = df["country"] + " [SEP] " + df["description"]
-        
+
         # Filter out rare varieties
         variety_counts = df["variety"].value_counts()
         varieties_to_keep = variety_counts[variety_counts >= min_count].index
@@ -114,11 +103,11 @@ def load_and_prepare_data(min_count=50):
         # Modify the train/validation/test split
         random_state = np.random.RandomState(42)
         random_numbers = random_state.rand(len(df))
-        
+
         df["split"] = "train"
         df.loc[random_numbers >= 0.8, "split"] = "test"
         df.loc[(random_numbers >= 0.7) & (random_numbers < 0.8), "split"] = "validation"
-        
+
         # Create HuggingFace Dataset with three splits
         dataset = DatasetDict({
             'train': Dataset.from_pandas(df[df['split'] == 'train']),
@@ -134,7 +123,7 @@ def load_and_prepare_data(min_count=50):
         unique_varieties = sorted(set(dataset['train']['variety']))
         label2id = {label: i for i, label in enumerate(unique_varieties)}
         id2label = {i: label for label, i in label2id.items()}
-        
+
         # Save the dataset
         dataset.save_to_disk(processed_dataset_path)
 
@@ -144,6 +133,7 @@ def train_model(dataset, label2id, id2label):
     # Initialize tokenizer and model
     model_id = "answerdotai/ModernBERT-base"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+
 
     try:
         tokenized_dataset = load_from_disk("tokenized_wine_dataset")
@@ -181,66 +171,58 @@ def train_model(dataset, label2id, id2label):
         label2id=label2id,
         id2label=id2label,
     )
-    
-    # Modify training arguments to use validation set
+
+    # --- WSD Setup ---
     training_args = TrainingArguments(
         output_dir="modernbert-variety",
         per_device_train_batch_size=256,
         per_device_eval_batch_size=256,
-        learning_rate=5e-5,  # This is the peak learning rate.
-        num_train_epochs=4,
-        logging_steps=200,
-        eval_steps=200,
-        eval_strategy="steps",
+        learning_rate=1e-4,
+        num_train_epochs=5,
+        logging_steps=250,
+        eval_steps=250,
+        evaluation_strategy="steps",
         save_strategy="steps",
-        save_steps=400,
+        save_steps=500,
         load_best_model_at_end=True,
         report_to="wandb",
         run_name="modernbert-wine-classification",
         metric_for_best_model="f1",
         greater_is_better=True,
         max_grad_norm=1.0,
-        skip_memory_metrics=True,
         bf16=True,
-        push_to_hub=True,  # Enable push to hub
-        hub_model_id="spawn99/modernbert-wine-classification"  # Replace with your Hub repo name
+        push_to_hub=True,
+        hub_model_id="spawn99/modernbert-wine-classification",
+        warmup_ratio=0.06,  
     )
 
-    # --- NEW: Create the optimizer and custom WSD scheduler ---
-    # Use AdamW as the optimizer.
     optimizer = AdamW(model.parameters(), lr=training_args.learning_rate)
-    
-    # Compute total training steps.
-    total_steps = (len(tokenized_dataset['train']) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
-    # Account for gradient accumulation steps if any.
-    if training_args.gradient_accumulation_steps > 1:
-        total_steps = total_steps // training_args.gradient_accumulation_steps
 
-    # Define scheduler hyperparameters.
-    warmup_ratio = 0.1  # Warmup for 10% of total steps.
-    decay_ratio = 0.1   # Decay for 10% of total steps.
-    min_lr_ratio = 0.1  # Minimum learning rate is 10% of peak.
-    
-    # Create the custom WSD learning rate scheduler.
+    # Calculate total steps (important for WSD)
+    total_steps = len(tokenized_dataset["train"]) // training_args.per_device_train_batch_size * training_args.num_train_epochs
+    total_steps = total_steps // training_args.gradient_accumulation_steps
+
+    # Create the WSD scheduler
     lr_scheduler = WSDLearningRateScheduler(
         optimizer=optimizer,
-        warmup_ratio=warmup_ratio,
-        decay_ratio=decay_ratio,
-        min_lr_ratio=min_lr_ratio,
+        warmup_ratio=training_args.warmup_ratio,
+        decay_ratio=0.1,
+        min_lr_ratio=0.1,
         total_steps=total_steps,
     )
-    # --- END NEW: optimizer and scheduler setup ---
+    # --- End WSD Setup ---
 
-    # Initialize trainer with validation set and pass (optimizer, scheduler)
+
+    # Initialize trainer with validation set, custom scheduler
     trainer = WeightedModernBERTTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["validation"],  # Use validation instead of test
+        eval_dataset=tokenized_dataset["validation"],
         class_weights=class_weights,
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-        optimizers=(optimizer, lr_scheduler)  # Pass the custom optimizer and scheduler
+        optimizers=(optimizer, lr_scheduler),  # Pass both optimizer and scheduler
     )
 
     # Train model
@@ -260,10 +242,10 @@ def compute_metrics(eval_pred):
 
 def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
-    
+
     predictions = []
     labels = []
-    
+
     for item in tqdm(tokenized_dataset['test']):
         # Use the same concatenation as during training:
         input_text = item['country'] + " [SEP] " + item['description']
@@ -272,11 +254,11 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
         predictions.append(pred['label'])
         # Convert the ground truth numeric label to the string label:
         labels.append(id2label[item['label']])
-    
+
     # Calculate accuracy
     accuracy = sum([p == l for p, l in zip(predictions, labels)]) / len(labels)
     print(f"Accuracy: {accuracy:.2f}")
-    
+
     # Calculate per-class F1 scores and other metrics
     report = classification_report(labels, predictions, target_names=list(id2label.values()), output_dict=True)
 
@@ -284,7 +266,7 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     print("\nPer-Class F1 Scores (for varieties with < 100 samples in the *training* set):")
     train_counts = tokenized_dataset['train'].to_pandas()['label'].value_counts()
     for variety, metrics in report.items():
-        if variety in id2label.values(): 
+        if variety in id2label.values():
             variety_id = label2id[variety]
             if variety_id in train_counts.index and train_counts[variety_id] < 100:
                 print(f"  {variety}: F1 = {metrics['f1-score']:.4f}")
@@ -293,8 +275,8 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     cm = confusion_matrix(labels, predictions)
     plt.figure(figsize=(10, 7))
     sns.heatmap(
-        cm, 
-        annot=True, 
+        cm,
+        annot=True,
         fmt='d',
         cmap='Blues',
         xticklabels=list(id2label.values()),
@@ -314,4 +296,4 @@ def main():
     evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label)
 
 if __name__ == "__main__":
-    main() 
+    main()
