@@ -156,7 +156,7 @@ def train_model(dataset, label2id, id2label):
         per_device_eval_batch_size=256,
         learning_rate=1e-4,
         num_train_epochs=5,
-        logging_steps=200,
+        logging_steps=100,
         eval_steps=100,
         eval_strategy="steps",
         save_strategy="steps",
