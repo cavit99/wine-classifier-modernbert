@@ -188,10 +188,6 @@ def train_model(dataset, label2id, id2label):
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
 
-    # Calculate total_training_steps *before* creating the scheduler.
-    num_training_steps = len(tokenized_dataset["train"]) // training_args.per_device_train_batch_size * training_args.num_train_epochs
-    trainer.create_scheduler(num_training_steps) 
-
     trainer.train()
     trainer.push_to_hub()
     return model, tokenizer, tokenized_dataset, training_args
