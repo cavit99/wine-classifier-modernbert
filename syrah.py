@@ -34,5 +34,14 @@ def check_syrah_distribution(repo_id: str = "spawn99/wine-reviews"):
             print("  Split is empty.")
         print("-" * 20)
 
+        # Check for Syrah variations (case-insensitive and whitespace)
+        print(f"Checking Syrah variations in {split}:")
+        syrah_variations = set()
+        for example in dataset[split]:
+            variety = example['variety']
+            if 'syrah' in variety.lower(): #case insensitive
+                syrah_variations.add(variety)
+        print(syrah_variations)
+
 if __name__ == "__main__":
     check_syrah_distribution()
