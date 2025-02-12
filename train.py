@@ -50,8 +50,8 @@ class WSDLearningRateScheduler(LambdaLR):
         self.decay_ratio = decay_ratio
         self.min_lr_ratio = min_lr_ratio
         self.total_steps = total_steps
-        self.peak_lr = optimizer.defaults['lr']
-        self.min_lr = self.peak_lr * min_lr_ratio
+        self.peak_lr = None
+        self.min_lr = None
 
         self.warmup_steps = int(self.warmup_ratio * self.total_steps)
         self.decay_steps = int(self.decay_ratio * self.total_steps)
@@ -63,6 +63,9 @@ class WSDLearningRateScheduler(LambdaLR):
         super().__init__(optimizer, self.lr_lambda, last_epoch=last_epoch)
 
     def lr_lambda(self, current_step):
+        if self.peak_lr is None:  # Initialize peak_lr and min_lr here
+            self.peak_lr = self.optimizer.defaults['lr']
+            self.min_lr = self.peak_lr * self.min_lr_ratio
         if current_step < self.warmup_steps:
             return float(current_step) / float(max(1, self.warmup_steps))
         elif current_step < self.warmup_steps + self.stable_steps:
