@@ -1,12 +1,10 @@
-import pandas as pd
 import numpy as np
-from datasets import Dataset, DatasetDict, load_from_disk
+from datasets import  DatasetDict, load_from_disk, load_dataset
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    pipeline,
     EarlyStoppingCallback,
     AdamW,
 )
@@ -14,10 +12,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
 import seaborn as sns
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 import torch
-import os
 
 
 class WeightedModernBERTTrainer(Trainer):
@@ -60,86 +56,62 @@ class WSDLearningRateScheduler(LambdaLR):
             return 1.0
         elif current_step < self.warmup_steps + self.stable_steps + self.decay_steps:
             decay_step = current_step - self.warmup_steps - self.stable_steps
-            decay_step = min(decay_step, self.decay_steps -1) #Clamp, as in PPLX
+            decay_step = min(decay_step, self.decay_steps - 1)  # Clamp, as in PPLX
             return (self.min_lr * self.peak_lr) / (decay_step / self.decay_steps * (self.peak_lr - self.min_lr) + self.min_lr)
         else:
             return self.min_lr / self.peak_lr
 
 
 
-def load_and_prepare_data(min_count=50):
-    processed_dataset_path = "processed_dataset"
+def load_and_prepare_data(min_count: int = 50) -> tuple[DatasetDict, dict[str, int], dict[int, str]]:
+    """
+    Loads the wine reviews dataset directly from the Hugging Face Hub,
+    creates a "text" column (combining country and description), filters
+    out rare wine varieties, and builds label mappings.
+    """
+    # Load the dataset from the Hugging Face Hub
+    dataset = load_dataset("spawn99/wine-reviews")
+    print("Loaded dataset from Hugging Face Hub:")
+    print({split: type(dataset[split]) for split in dataset.keys()})
 
-    if os.path.exists(processed_dataset_path):
-        print("Loading preprocessed dataset...")
-        dataset = load_from_disk(processed_dataset_path)
-        # Recreate label mappings
-        unique_varieties = sorted(set(dataset['train']['variety']))
-        label2id = {label: i for i, label in enumerate(unique_varieties)}
-        id2label = {i: label for label, i in label2id.items()}
-    else:
-        # Load data
-        df1 = pd.read_csv("dataset/winemag-data_first150k.csv")
-        df2 = pd.read_csv("dataset/winemag-data-130k-v2.csv")
+    # 1. Combine 'country' and 'description' into a 'text' column.
+    def create_text_column(example: dict) -> dict:
+        example['text'] = f"{example['country']} [SEP] {example['description']}"
+        return example
+    dataset = dataset.map(create_text_column)
 
-        # Select relevant columns and handle missing values
-        df1 = df1[["country", "description", "variety"]]
-        df2 = df2[["country", "description", "variety"]]
-        df1 = df1.dropna(subset=["country", "description", "variety"])
-        df2 = df2.dropna(subset=["country", "description", "variety"])
+    # 2. Filter out rare varieties *before* splitting if needed.
+    #    First, collect variety counts from the entire dataset
+    def count_varieties(examples: dict) -> dict:
+        counts = {}
+        for variety in examples['variety']:
+            counts[variety] = counts.get(variety, 0) + 1
+        return {'variety_counts': [counts.get(v,0) for v in examples['variety']]}
 
-        # Combine dataframes
-        df = pd.concat([df1, df2], ignore_index=True)
+    dataset = dataset.map(count_varieties, batched=True)
+    dataset = dataset.filter(lambda example: example['variety_counts'] >= min_count)
+    dataset = dataset.remove_columns('variety_counts')
 
-        # Combine country and description
-        df["text"] = df["country"] + " [SEP] " + df["description"]
+    # 3. Create label mappings based on the *filtered* training data.
+    unique_varieties = sorted(list(set(dataset['train']['variety'])))
+    label2id = {label: i for i, label in enumerate(unique_varieties)}
+    id2label = {i: label for label, i in label2id.items()}
 
-        # Filter out rare varieties
-        variety_counts = df["variety"].value_counts()
-        varieties_to_keep = variety_counts[variety_counts >= min_count].index
-        df = df[df["variety"].isin(varieties_to_keep)]
-        print(f"Number of examples after filtering: {len(df)}")
-
-        # Modify the train/validation/test split
-        random_state = np.random.RandomState(42)
-        random_numbers = random_state.rand(len(df))
-
-        df["split"] = "train"
-        df.loc[random_numbers >= 0.8, "split"] = "test"
-        df.loc[(random_numbers >= 0.7) & (random_numbers < 0.8), "split"] = "validation"
-
-        # Create HuggingFace Dataset with three splits
-        dataset = DatasetDict({
-            'train': Dataset.from_pandas(df[df['split'] == 'train']),
-            'validation': Dataset.from_pandas(df[df['split'] == 'validation']),
-            'test': Dataset.from_pandas(df[df['split'] == 'test'])
-        })
-
-        print(f"Training set size: {len(dataset['train'])}")
-        print(f"Validation set size: {len(dataset['validation'])}")
-        print(f"Test set size: {len(dataset['test'])}")
-
-        # Create label mappings
-        unique_varieties = sorted(set(dataset['train']['variety']))
-        label2id = {label: i for i, label in enumerate(unique_varieties)}
-        id2label = {i: label for label, i in label2id.items()}
-
-        # Save the dataset
-        dataset.save_to_disk(processed_dataset_path)
+    # 4. Select only necessary columns
+    dataset = dataset.remove_columns([col for col in dataset['train'].column_names if col not in ['text', 'variety']])
 
     return dataset, label2id, id2label
 
 def train_model(dataset, label2id, id2label):
-    # Initialize tokenizer and model
     model_id = "answerdotai/ModernBERT-base"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-
 
     try:
         tokenized_dataset = load_from_disk("tokenized_wine_dataset")
         print("Tokenized dataset loaded from disk.")
     except Exception as e:
-        print("Tokenized dataset not found. Tokenizing...")
+        print("Tokenized dataset not found. Tokenizing now...")
+        # Tokenize by forming a text field from 'country' and 'description'
         def tokenize_function(examples):
             tokens = tokenizer(
                 examples["text"],
@@ -147,15 +119,12 @@ def train_model(dataset, label2id, id2label):
                 truncation=True,
                 max_length=256
             )
-            # Convert wine variety to numerical label using your mapping
             tokens["label"] = [label2id[variety] for variety in examples["variety"]]
             return tokens
 
-        # Tokenize dataset
         tokenized_dataset = dataset.map(tokenize_function, batched=True)
-        tokenized_dataset.save_to_disk("tokenized_wine_dataset")  # Save it!
+        tokenized_dataset.save_to_disk("tokenized_wine_dataset")
 
-    # Calculate class weights
     train_labels = tokenized_dataset['train']['label']
     class_weights = compute_class_weight(
         'balanced',
@@ -164,7 +133,6 @@ def train_model(dataset, label2id, id2label):
     )
     class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
-    # Initialize model
     model = AutoModelForSequenceClassification.from_pretrained(
         model_id,
         num_labels=len(label2id),
@@ -174,7 +142,7 @@ def train_model(dataset, label2id, id2label):
 
     # --- WSD Setup ---
     training_args = TrainingArguments(
-        output_dir="modernbert-variety",
+        output_dir="modernbert-winevariety",
         per_device_train_batch_size=256,
         per_device_eval_batch_size=256,
         learning_rate=1e-4,
@@ -212,7 +180,6 @@ def train_model(dataset, label2id, id2label):
     )
     # --- End WSD Setup ---
 
-
     # Initialize trainer with validation set, custom scheduler
     trainer = WeightedModernBERTTrainer(
         model=model,
@@ -220,40 +187,48 @@ def train_model(dataset, label2id, id2label):
         train_dataset=tokenized_dataset["train"],
         eval_dataset=tokenized_dataset["validation"],
         class_weights=class_weights,
-        compute_metrics=compute_metrics,
+        compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
         callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         optimizers=(optimizer, lr_scheduler),  # Pass both optimizer and scheduler
     )
 
-    # Train model
+    # Train model, return training args
     trainer.train()
 
     # Push the best model to the Hugging Face Hub.
     trainer.push_to_hub()
 
-    return model, tokenizer, tokenized_dataset
+    return model, tokenizer, tokenized_dataset, training_args
 
-def compute_metrics(eval_pred):
+def compute_metrics(training_args, eval_pred):
     predictions, labels = eval_pred
     preds = np.argmax(predictions, axis=1)
     f1_val = f1_score(labels, preds, average="weighted")
     acc = accuracy_score(labels, preds)
     return {"accuracy": acc, "f1": f1_val}
 
-def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
-    classifier = pipeline("text-classification", model=model, tokenizer=tokenizer)
+def evaluate_model(model: AutoModelForSequenceClassification, tokenizer: AutoTokenizer, tokenized_dataset: DatasetDict, label2id: dict[str, int], id2label: dict[int, str], training_args: TrainingArguments):
+    # Initialize trainer for evaluation (use passed training_args)
+    trainer = WeightedModernBERTTrainer(
+        model=model,
+        args=training_args.set_report_to([]),  
+        train_dataset=None,
+        eval_dataset=tokenized_dataset["test"],
+        class_weights=None,  
+        compute_metrics=lambda eval_pred: compute_metrics(training_args, eval_pred),
+    )
 
-    predictions = []
-    labels = []
+    # Use the Trainer's evaluate() method
+    eval_results = trainer.evaluate()
+    print(f"Evaluation Results: {eval_results}")
 
-    for item in tqdm(tokenized_dataset['test']):
-        # Use the same concatenation as during training:
-        input_text = item['country'] + " [SEP] " + item['description']
-        pred = classifier(input_text)[0]
-        # Use the predicted string label directly:
-        predictions.append(pred['label'])
-        # Convert the ground truth numeric label to the string label:
-        labels.append(id2label[item['label']])
+    # Extract predictions and labels from the evaluation results
+    predictions = np.argmax(eval_results.predictions, axis=1)
+    labels = eval_results.label_ids
+
+    # Convert numeric labels to string labels
+    predictions = [id2label[p] for p in predictions]
+    labels = [id2label[l] for l in labels]
 
     # Calculate accuracy
     accuracy = sum([p == l for p, l in zip(predictions, labels)]) / len(labels)
@@ -287,13 +262,13 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     plt.title('Confusion Matrix')
     plt.show()
 
-def main():
+def main():  # No parameters needed
     # Load and prepare data, filtering rare varieties
     dataset, label2id, id2label = load_and_prepare_data(min_count=50)
 
     print("Training model...")
-    model, tokenizer, tokenized_dataset = train_model(dataset, label2id, id2label)
-    evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label)
+    model, tokenizer, tokenized_dataset, training_args = train_model(dataset, label2id, id2label)  
+    evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label, training_args)  
 
 if __name__ == "__main__":
     main()
