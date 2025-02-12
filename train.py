@@ -6,7 +6,8 @@ from transformers import (
     AutoTokenizer,
     Trainer,
     TrainingArguments,
-    pipeline
+    pipeline,
+    EarlyStoppingCallback
 )
 from sklearn.metrics import confusion_matrix, classification_report, f1_score
 import seaborn as sns
@@ -15,6 +16,7 @@ from tqdm import tqdm
 from sklearn.utils.class_weight import compute_class_weight
 import torch
 import os
+import wandb
 
 class WeightedModernBERTTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
@@ -30,11 +32,15 @@ class WeightedModernBERTTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 def load_and_prepare_data(min_count=50):
-    processed_data_path = "processed_wine_data.pkl"
+    processed_dataset_path = "processed_dataset"
 
-    if os.path.exists(processed_data_path):
-        print("Loading preprocessed data...")
-        df = pd.read_pickle(processed_data_path)
+    if os.path.exists(processed_dataset_path):
+        print("Loading preprocessed dataset...")
+        dataset = load_from_disk(processed_dataset_path)
+        # Recreate label mappings
+        unique_varieties = sorted(set(dataset['train']['variety']))
+        label2id = {label: i for i, label in enumerate(unique_varieties)}
+        id2label = {i: label for label, i in label2id.items()}
     else:
         # Load data
         df1 = pd.read_csv("dataset/winemag-data_first150k.csv")
@@ -58,27 +64,33 @@ def load_and_prepare_data(min_count=50):
         df = df[df["variety"].isin(varieties_to_keep)]
         print(f"Number of examples after filtering: {len(df)}")
 
-        # Create train/test split
-        train_fraction = 0.8
-        random_mask = np.random.RandomState(42).rand(len(df)) < train_fraction
-        df["train_test_split"] = np.where(random_mask, "train", "test")
+        # Modify the train/validation/test split
+        random_state = np.random.RandomState(42)
+        random_numbers = random_state.rand(len(df))
+        
+        df["split"] = "train"
+        df.loc[random_numbers >= 0.8, "split"] = "test"
+        df.loc[(random_numbers >= 0.7) & (random_numbers < 0.8), "split"] = "validation"
+        
+        # Create HuggingFace Dataset with three splits
+        dataset = DatasetDict({
+            'train': Dataset.from_pandas(df[df['split'] == 'train']),
+            'validation': Dataset.from_pandas(df[df['split'] == 'validation']),
+            'test': Dataset.from_pandas(df[df['split'] == 'test'])
+        })
 
-        df.to_pickle(processed_data_path)
+        print(f"Training set size: {len(dataset['train'])}")
+        print(f"Validation set size: {len(dataset['validation'])}")
+        print(f"Test set size: {len(dataset['test'])}")
 
-    # Create label mappings
-    unique_varieties = df["variety"].unique()
-    label2id = {label: i for i, label in enumerate(sorted(unique_varieties))}
-    id2label = {i: label for label, i in label2id.items()}
-    df['label'] = df['variety'].map(label2id)
-    print(f"Number of unique varieties: {len(unique_varieties)}")
+        # Create label mappings
+        unique_varieties = sorted(set(dataset['train']['variety']))
+        label2id = {label: i for i, label in enumerate(unique_varieties)}
+        id2label = {i: label for label, i in label2id.items()}
+        
+        # Save the dataset
+        dataset.save_to_disk(processed_dataset_path)
 
-    # Convert to HuggingFace Dataset
-    dataset = DatasetDict({
-        'train': Dataset.from_pandas(df[df['train_test_split'] == 'train']),
-        'test': Dataset.from_pandas(df[df['train_test_split'] == 'test'])
-    })
-
-    print(f"Training set size: {len(dataset['train'])}")
     return dataset, label2id, id2label
 
 def train_model(dataset, label2id, id2label):
@@ -94,8 +106,8 @@ def train_model(dataset, label2id, id2label):
         print("Tokenized dataset not found. Tokenizing...")
         def tokenize_function(examples):
             return tokenizer(
-                examples['text'],
-                padding='max_length',
+                examples["text"],
+                padding="max_length",
                 truncation=True,
                 max_length=256
             )
@@ -121,7 +133,7 @@ def train_model(dataset, label2id, id2label):
         id2label=id2label,
     )
 
-    # Training arguments
+    # Modify training arguments to use validation set
     training_args = TrainingArguments(
         output_dir="modernbert-variety",
         per_device_train_batch_size=128,
@@ -134,6 +146,8 @@ def train_model(dataset, label2id, id2label):
         save_strategy="steps",
         save_steps=300,
         load_best_model_at_end=True,
+        report_to="wandb",
+        run_name="modernbert-wine-classification",
         metric_for_best_model="f1",
         greater_is_better=True,
         max_grad_norm=1.0,
@@ -141,14 +155,15 @@ def train_model(dataset, label2id, id2label):
         bf16=True,
     )
 
-    # Initialize trainer
+    # Initialize trainer with validation set
     trainer = WeightedModernBERTTrainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["test"],
+        eval_dataset=tokenized_dataset["validation"],  # Use validation instead of test
         class_weights=class_weights,
-        compute_metrics=compute_metrics
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
     # Train model
@@ -169,7 +184,9 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
     labels = []
     
     for item in tqdm(tokenized_dataset['test']):
-        pred = classifier(item['text'])[0]
+        # Use the same concatenation as during training:
+        input_text = item['country'] + " [SEP] " + item['description']
+        pred = classifier(input_text)[0]
         predictions.append(int(pred['label'].split('_')[-1]))
         labels.append(item['label'])
     
@@ -182,10 +199,10 @@ def evaluate_model(model, tokenizer, tokenized_dataset, label2id, id2label):
 
     # Print F1 scores for tail classes (varieties with < 100 samples in the *training* set):
     print("\nPer-Class F1 Scores (for varieties with < 100 samples in the *training* set):")
+    train_counts = tokenized_dataset['train'].to_pandas()['label'].value_counts()
     for variety, metrics in report.items():
         if variety in id2label.values(): 
             variety_id = label2id[variety]
-            train_counts = tokenized_dataset['train'].to_pandas()['label'].value_counts()
             if variety_id in train_counts.index and train_counts[variety_id] < 100:
                 print(f"  {variety}: F1 = {metrics['f1-score']:.4f}")
 
