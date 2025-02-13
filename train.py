@@ -203,12 +203,11 @@ def train_model(dataset, label2id, id2label):
         run_name="modernbert-wine-classification",
         metric_for_best_model="f1",
         greater_is_better=True,
-        max_grad_norm=1.0,
         bf16=True,
         push_to_hub=True,
         hub_model_id="spawn99/modernbert-wine-classification",
         warmup_ratio=0.1,
-        lr_scheduler_type="cosine",
+        lr_scheduler_type="warmup_stable_decay",
     )
 
     trainer = WeightedModernBERTTrainer(
