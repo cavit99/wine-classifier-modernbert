@@ -8,8 +8,7 @@ License: MIT License
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import gradio as gr
-import json  # Added for JSON conversion
-
+import json
 
 def run_inference(review_text: str) -> str:
     """
@@ -95,17 +94,19 @@ if __name__ == "__main__":
         inputs=[
             gr.Textbox(label="Country", placeholder="Enter country of origin..."),
             gr.Textbox(label="Description", placeholder="Enter wine review description..."),
-            # New radio input to choose between JSON and plain text output formats:
             gr.Radio(choices=["JSON", "Text"], value="JSON", label="Output Format")
         ],
-        # Changed outputs to a Textbox so that plain text output shows naturally
         outputs=gr.Textbox(label="Prediction"),
         title="Wine Variety Predictor",
         description=(
             "Predict the wine variety based on the country and wine review.\n\n"
-            "This tool uses ModernBERT, an encoder-only classifier, trained on the wine reviews dataset\n"
-            "(model: spawn99/modernbert-wine-classification, dataset: spawn99/wine-reviews).\n\n"
-            "Use the Output Format selector to toggle between a JSON-formatted result and a plain text prediction."
+            "This tool uses [ModernBERT](https://huggingface.co/answerdotai/ModernBERT-base), "
+            "an encoder-only classifier, trained on the [wine reviews dataset]"
+            "(https://huggingface.co/datasets/spawn99/wine-reviews)\n\n"
+            "**Model Resources:**\n"
+            "- Model: [spawn99/modernbert-wine-classification](https://huggingface.co/spawn99/modernbert-wine-classification)\n"
+            "- Dataset: [spawn99/wine-reviews](https://huggingface.co/datasets/spawn99/wine-reviews)\n\n"
+            "*Cavit Erginsoy, 2025*\n"
         )
     )
     iface.launch()
