@@ -121,7 +121,7 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
     for attempt in range(max_attempts):
         current_seed = 42 + attempt
         split1 = full_dataset.train_test_split(
-            test_size=0.3, stratify_by_column="temp_label", seed=current_seed
+            test_size=0.3, stratify_by_column="temp_label", seed=current_seed+99
         )
         temp_split = split1["test"].train_test_split(
             test_size=0.5, stratify_by_column="temp_label", seed=current_seed
@@ -148,7 +148,8 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
     else:
         print("Warning: Could not achieve valid splits after multiple attempts. Proceeding with current splits.")
     
-    return dataset_splits, label2id, id2label
+    # Return as a DatasetDict so that it supports the .map() method.
+    return DatasetDict(dataset_splits), label2id, id2label
 
 
 def train_model(dataset, label2id, id2label):
