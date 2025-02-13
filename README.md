@@ -4,6 +4,8 @@ This project classifies wine varieties based on country and description using a 
 
 Try it in action here: https://huggingface.co/spaces/spawn99/wine-variety
 
+Try it in action here: https://huggingface.co/spaces/spawn99/wine-variety
+
 ## Features
 
 - 🍷 Trained on combined country + description
