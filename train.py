@@ -1,5 +1,5 @@
 import numpy as np
-from datasets import  DatasetDict, load_from_disk, load_dataset
+from datasets import  DatasetDict, load_from_disk, load_dataset, concatenate_datasets
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -12,6 +12,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.utils.class_weight import compute_class_weight
 import torch
+from collections import Counter
 
 
 class WeightedModernBERTTrainer(Trainer):
@@ -22,51 +23,109 @@ class WeightedModernBERTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        logits = outputs.logits
+        # Convert logits to full precision to aid numerical stability, especially in mixed-precision training.
+        logits = outputs.logits.float()
         weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
         loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
 
-def load_and_prepare_data(min_count: int = 50) -> tuple[DatasetDict, dict[str, int], dict[int, str]]:
+def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tuple[DatasetDict, dict[str, int], dict[int, str]]:
     """
-    Loads the wine reviews dataset directly from the Hugging Face Hub,
-    creates a "text" column (combining country and description), filters
-    out rare wine varieties, and builds label mappings.
+    Global Filtering Before Splitting (Stratified):
+    
+    Loads the wine reviews dataset from the Hugging Face Hub, combines all splits,
+    creates a "text" column, normalizes the 'variety' column,
+    conducts blend normalization, 
+    filters rare classes, and then performs a stratified split into train, validation, and test sets.
+    
+    Additionally, it ensures that each split has at least one sample per class (based on the training set).
     """
-    # Load the dataset from the Hugging Face Hub
-    dataset = load_dataset("spawn99/wine-reviews")
+    # Load the dataset from the Hugging Face Hub (original splits will be ignored)
+    original_dataset = load_dataset("spawn99/wine-reviews")
     print("Loaded dataset from Hugging Face Hub:")
-    print({split: type(dataset[split]) for split in dataset.keys()})
-
+    print({split: type(original_dataset[split]) for split in original_dataset.keys()})
+    
+    # Combine all splits into one global dataset
+    full_dataset = concatenate_datasets([original_dataset[split] for split in original_dataset.keys()])
+    
     # 1. Combine 'country' and 'description' into a 'text' column.
     def create_text_column(example: dict) -> dict:
         example['text'] = f"{example['country']} [SEP] {example['description']}"
         return example
-    dataset = dataset.map(create_text_column)
-
-    # 2. Filter out rare varieties *before* splitting if needed.
-    #    First, collect variety counts from the entire dataset
-    def count_varieties(examples: dict) -> dict:
-        counts = {}
-        for variety in examples['variety']:
-            counts[variety] = counts.get(variety, 0) + 1
-        return {'variety_counts': [counts.get(v,0) for v in examples['variety']]}
-
-    dataset = dataset.map(count_varieties, batched=True)
-    dataset = dataset.filter(lambda example: example['variety_counts'] >= min_count)
-    dataset = dataset.remove_columns('variety_counts')
-
-    # 3. Create label mappings based on the *filtered* training data.
-    unique_varieties = sorted(list(set(dataset['train']['variety'])))
-    label2id = {label: i for i, label in enumerate(unique_varieties)}
-    id2label = {i: label for label, i in label2id.items()}
-
-    # 4. Select only necessary columns
-    dataset = dataset.remove_columns([col for col in dataset['train'].column_names if col not in ['text', 'variety']])
-
-    return dataset, label2id, id2label
+    full_dataset = full_dataset.map(create_text_column)
+    
+    # 2. Initial normalization of the 'variety' column.
+    def custom_normalize(example: dict) -> dict:
+        var = example['variety'].strip()
+        var_lower = var.lower()
+        # Mark rows to drop if the variety is exactly "red blend" or "white blend" or if "sparkling" is present.
+        example['drop'] = True if (var_lower in ['red blend', 'white blend'] or 'sparkling' in var_lower) else False
+        example['variety'] = var 
+        return example
+    full_dataset = full_dataset.map(custom_normalize)
+    full_dataset = full_dataset.filter(lambda ex: not ex['drop'])
+    full_dataset = full_dataset.remove_columns("drop")
+    
+    # 3. Compute global blend frequency counts.
+    blend_counts = {}
+    for example in full_dataset:
+        var = example['variety']
+        if '-' in var:
+            blend_counts[var] = blend_counts.get(var, 0) + 1
+    
+    # 4. Normalize blends based on their global frequency.
+    def normalize_blends(example: dict) -> dict:
+        var = example['variety']
+        if '-' in var:
+            if blend_counts.get(var, 0) < blend_threshold:
+                left_grape = var.split('-')[0].strip()
+                example['variety'] = left_grape + " Blend"
+        return example
+    full_dataset = full_dataset.map(normalize_blends)
+    
+    # 5. Global Filtering: Remove rare classes based on overall variety counts.
+    global_counts = Counter(full_dataset["variety"])
+    def add_global_count(example: dict) -> dict:
+        example["variety_counts"] = global_counts.get(example["variety"], 0)
+        return example
+    full_dataset = full_dataset.map(add_global_count)
+    full_dataset = full_dataset.filter(lambda ex: ex['variety_counts'] >= min_count)
+    full_dataset = full_dataset.remove_columns("variety_counts")
+    
+    # 6. Only keep the necessary columns.
+    columns_to_keep = ['text', 'variety']
+    columns_to_remove = [col for col in full_dataset.column_names if col not in columns_to_keep]
+    full_dataset = full_dataset.remove_columns(columns_to_remove)
+    
+    # 7. Perform stratified splitting into train, validation, and test sets.
+    # Attempt splitting multiple times if any split is missing classes.
+    max_attempts = 10
+    for attempt in range(max_attempts):
+        current_seed = 42 + attempt
+        # First, split 70% for training and 30% as a temporary split.
+        split1 = full_dataset.train_test_split(test_size=0.3, stratify_by_column="variety", seed=current_seed)
+        # Then, further split the temporary 30% into 15% validation and 15% test sets.
+        temp_split = split1["test"].train_test_split(test_size=0.5, stratify_by_column="variety", seed=current_seed)
+        dataset_splits = {
+            "train": split1["train"],
+            "validation": temp_split["train"],
+            "test": temp_split["test"]
+        }
+        # 8. Create label mappings based solely on the training set.
+        unique_varieties = sorted(list(set(dataset_splits['train']['variety'])))
+        label2id = {label: i for i, label in enumerate(unique_varieties)}
+        id2label = {i: label for label, i in label2id.items()}
+        
+        if validate_splits(dataset_splits, label2id):
+            break
+        else:
+            print(f"Resplitting attempt {attempt+1} failed. Trying new split...")
+    else:
+        print("Warning: Could not achieve valid splits after multiple attempts. Proceeding with current splits.")
+    
+    return dataset_splits, label2id, id2label
 
 
 def train_model(dataset, label2id, id2label):
@@ -85,12 +144,12 @@ def train_model(dataset, label2id, id2label):
                 truncation=True,
                 max_length=256
             )
-            tokens["label"] = [label2id[variety] for variety in examples["variety"]]
+            tokens["labels"] = [label2id[variety] for variety in examples["variety"]]
             return tokens
         tokenized_dataset = dataset.map(tokenize_function, batched=True)
         tokenized_dataset.save_to_disk("tokenized_wine_dataset")
 
-    train_labels = tokenized_dataset['train']['label']
+    train_labels = tokenized_dataset['train']['labels']
     class_weights = compute_class_weight(
         'balanced',
         classes=np.unique(train_labels),
@@ -107,9 +166,9 @@ def train_model(dataset, label2id, id2label):
 
     training_args = TrainingArguments(
         output_dir="modernbert-winevariety",
-        per_device_train_batch_size=192,
-        per_device_eval_batch_size=192,
-        learning_rate=8e-5,
+        per_device_train_batch_size=256,
+        per_device_eval_batch_size=256,
+        learning_rate=5e-5,
         num_train_epochs=5,
         logging_steps=100,
         eval_steps=100,
@@ -125,7 +184,7 @@ def train_model(dataset, label2id, id2label):
         bf16=True,
         push_to_hub=True,
         hub_model_id="spawn99/modernbert-wine-classification",
-        warmup_ratio=0.08,
+        warmup_ratio=0.1,
         lr_scheduler_type="linear",
     )
 
@@ -197,7 +256,7 @@ def evaluate_model(
 
     # Print F1 scores for tail classes (varieties with < 100 samples in the training set)
     print("\nPer-Class F1 Scores (for varieties with < 100 samples in the training set):")
-    train_counts = tokenized_dataset["train"].to_pandas()["label"].value_counts()
+    train_counts = tokenized_dataset["train"].to_pandas()["labels"].value_counts()
     for variety, metrics in report.items():
         if variety in id2label.values():
             variety_id = label2id[variety]
@@ -221,9 +280,26 @@ def evaluate_model(
     plt.show()
 
 
+def validate_splits(dataset_splits, label2id):
+    """
+    Validate that each split has at least one sample per class.
+    Return True if all splits contain at least one sample for every class,
+    otherwise return False and print warnings.
+    """
+    valid = True
+    for split_name, dataset in dataset_splits.items():
+        counts = Counter(dataset["variety"])
+        missing = [cls for cls in label2id if cls not in counts or counts[cls] == 0]
+        if missing:
+            print(f"Warning: In the '{split_name}' split, the following classes are missing: {missing}")
+            valid = False
+    return valid
+
+
 def main():
     # Load and prepare data, filtering rare varieties
     dataset, label2id, id2label = load_and_prepare_data(min_count=50)
+    validate_splits(dataset, label2id)
 
     print("Training model...")
     model, tokenizer, tokenized_dataset, training_args = train_model(dataset, label2id, id2label)
