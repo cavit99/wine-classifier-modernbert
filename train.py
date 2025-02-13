@@ -1,5 +1,5 @@
 import numpy as np
-from datasets import  DatasetDict, load_from_disk, load_dataset, concatenate_datasets
+from datasets import  DatasetDict, load_from_disk, load_dataset, concatenate_datasets, ClassLabel
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
@@ -58,15 +58,12 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
     
     # 2. Initial normalization of the 'variety' column.
     def custom_normalize(example: dict) -> dict:
-        # Check if the 'variety' field is None
         if example['variety'] is None:
             example['drop'] = True
             return example
 
         var = example['variety'].strip()
         var_lower = var.lower()
-        
-        # Mark rows to drop if the variety is exactly "red blend" or "white blend" or if "sparkling" is present.
         example['drop'] = var_lower in ['red blend', 'white blend'] or 'sparkling' in var_lower
         example['variety'] = var 
         return example
@@ -105,23 +102,39 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
     columns_to_remove = [col for col in full_dataset.column_names if col not in columns_to_keep]
     full_dataset = full_dataset.remove_columns(columns_to_remove)
     
+    # --- Added for stratified splitting ---
+    # Create a temporary column for stratification by converting the string labels to integers.
+    unique_varieties = sorted(list(set(full_dataset["variety"])))
+    class_label = ClassLabel(names=unique_varieties)
+    def add_temp_label(example: dict) -> dict:
+        example["temp_label"] = class_label.str2int(example["variety"])
+        return example
+    full_dataset = full_dataset.map(add_temp_label)
+    # ------------------------------------------
+    
     # 7. Perform stratified splitting into train, validation, and test sets.
-    # Attempt splitting multiple times if any split is missing classes.
     max_attempts = 10
     for attempt in range(max_attempts):
         current_seed = 42 + attempt
-        # First, split 70% for training and 30% as a temporary split.
-        split1 = full_dataset.train_test_split(test_size=0.3, stratify_by_column="variety", seed=current_seed)
-        # Then, further split the temporary 30% into 15% validation and 15% test sets.
-        temp_split = split1["test"].train_test_split(test_size=0.5, stratify_by_column="variety", seed=current_seed)
+        split1 = full_dataset.train_test_split(
+            test_size=0.3, stratify_by_column="temp_label", seed=current_seed
+        )
+        temp_split = split1["test"].train_test_split(
+            test_size=0.5, stratify_by_column="temp_label", seed=current_seed
+        )
         dataset_splits = {
             "train": split1["train"],
             "validation": temp_split["train"],
             "test": temp_split["test"]
         }
+        # Remove the temporary column from each split.
+        for split_name in dataset_splits:
+            if "temp_label" in dataset_splits[split_name].column_names:
+                dataset_splits[split_name] = dataset_splits[split_name].remove_columns("temp_label")
+    
         # 8. Create label mappings based solely on the training set.
-        unique_varieties = sorted(list(set(dataset_splits['train']['variety'])))
-        label2id = {label: i for i, label in enumerate(unique_varieties)}
+        unique_varieties_train = sorted(list(set(dataset_splits['train']['variety'])))
+        label2id = {label: i for i, label in enumerate(unique_varieties_train)}
         id2label = {i: label for label, i in label2id.items()}
         
         if validate_splits(dataset_splits, label2id):
