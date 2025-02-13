@@ -58,10 +58,16 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
     
     # 2. Initial normalization of the 'variety' column.
     def custom_normalize(example: dict) -> dict:
+        # Check if the 'variety' field is None
+        if example['variety'] is None:
+            example['drop'] = True
+            return example
+
         var = example['variety'].strip()
         var_lower = var.lower()
+        
         # Mark rows to drop if the variety is exactly "red blend" or "white blend" or if "sparkling" is present.
-        example['drop'] = True if (var_lower in ['red blend', 'white blend'] or 'sparkling' in var_lower) else False
+        example['drop'] = var_lower in ['red blend', 'white blend'] or 'sparkling' in var_lower
         example['variety'] = var 
         return example
     full_dataset = full_dataset.map(custom_normalize)
