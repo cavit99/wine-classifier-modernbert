@@ -110,6 +110,10 @@ def load_and_prepare_data(min_count: int = 50, blend_threshold: int = 150) -> tu
         example["temp_label"] = class_label.str2int(example["variety"])
         return example
     full_dataset = full_dataset.map(add_temp_label)
+    
+    # **Fix: Cast the temporary column to a ClassLabel column for stratification**
+    full_dataset = full_dataset.cast_column("temp_label", class_label)
+    
     # ------------------------------------------
     
     # 7. Perform stratified splitting into train, validation, and test sets.
