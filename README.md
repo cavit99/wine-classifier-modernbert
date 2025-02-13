@@ -3,6 +3,8 @@
 
 This project classifies wine varieties based on country and description using a fine-tuned ModernBERT model. The system handles class imbalance through weighted loss and employs careful dataset stratification.
 
+Try it in action here: https://huggingface.co/spaces/spawn99/wine-variety
+
 ## Features
 
 - 🍷 Trained on combined country + description
