@@ -189,15 +189,15 @@ def train_model(dataset, label2id, id2label):
 
     training_args = TrainingArguments(
         output_dir="modernbert-winevariety",
-        per_device_train_batch_size=256,
-        per_device_eval_batch_size=256,
+        per_device_train_batch_size=128,
+        per_device_eval_batch_size=128,
         learning_rate=5e-5,
         num_train_epochs=5,
         logging_steps=113,
-        eval_steps=226,
+        eval_steps=113,
         eval_strategy="steps",
         save_strategy="steps",
-        save_steps=226,
+        save_steps=113,
         load_best_model_at_end=True,
         report_to="wandb",
         run_name="modernbert-wine-classification",
@@ -208,7 +208,7 @@ def train_model(dataset, label2id, id2label):
         push_to_hub=True,
         hub_model_id="spawn99/modernbert-wine-classification",
         warmup_ratio=0.1,
-        lr_scheduler_type="linear",
+        lr_scheduler_type="cosine",
     )
 
     trainer = WeightedModernBERTTrainer(

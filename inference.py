@@ -17,7 +17,9 @@ def run_inference(review_text: str) -> str:
     # If you trained with `push_to_hub` using hub_model_id="spawn99/modernbert-wine-classification",
     # then this is the model to load.
     model_id = "spawn99/modernbert-wine-classification"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Use the tokenizer from answerdotai/ModernBERT-base
+    tokenizer_id = "answerdotai/ModernBERT-base"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
     model = AutoModelForSequenceClassification.from_pretrained(model_id)
     
     # Tokenize the input text.
@@ -45,7 +47,7 @@ def run_inference(review_text: str) -> str:
 
 def main():
     # Default review text following the same format used in training.
-    default_review = "France [SEP] The wine has a vibrant bouquet with hints of dark berries and a subtle oak finish."
+    default_review = "Italy [SEP] Tar and roses collide with grip – this collective-made wine marries wild strawberry acidity to tannins like suede gloves."
     
     # Optionally allow for command line input:
     # e.g., python inference.py "Italy [SEP] This wine offers fresh aromas of cherry and plum with a smooth finish."
