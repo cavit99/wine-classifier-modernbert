@@ -23,8 +23,7 @@ class WeightedModernBERTTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        # Convert logits to full precision to aid numerical stability, especially in mixed-precision training.
-        logits = outputs.logits.float()
+        logits = outputs.logits
         weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
         loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
         loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
